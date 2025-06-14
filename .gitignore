@@ -1,0 +1,15 @@
+# Nuitka build outputs
+/dist-standalone/
+/build/
+/dist-app/
+*.build/
+*.dist/
+*.onefile-build/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Other common build artifacts
+.nuitka/
