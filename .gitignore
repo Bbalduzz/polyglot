@@ -1,5 +1,6 @@
 # Nuitka build outputs
 /dist-standalone/
+/dist-standalone-v2/
 /build/
 /dist-app/
 *.build/
@@ -13,3 +14,5 @@ __pycache__/
 
 # Other common build artifacts
 .nuitka/
+
+src/tesseract/*

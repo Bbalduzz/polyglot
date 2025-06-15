@@ -2,7 +2,7 @@ import flet as ft
 import mss
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import multiprocessing
 import tempfile
 import json
@@ -37,17 +37,22 @@ import argostranslate.package
 import argostranslate.translate
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-import pytesseract
 import cv2
 import numpy as np
 
 import traceback
-
 from ui.components import (
     FactoryButton, FactorySecondaryButton, FactoryTextField, FactoryCheckBox,
     FactoryDropdown, FactoryDropdownOption, FactoryCard, FactoryField,
     colors_map
 )
+import platform
+try:
+    from ocrmac import ocrmac
+    OCRMAC_AVAILABLE = True
+except ImportError:
+    OCRMAC_AVAILABLE = False
+
 
 # ============================================================================
 # DATA MODELS
@@ -170,16 +175,151 @@ class TranslationService:
             self.available_packages = argostranslate.package.get_available_packages()
             self.installed_packages = argostranslate.package.get_installed_packages()
             print(f"Loaded {len(self.installed_packages)} installed translation packages")
+                
         except Exception as e:
             print(f"Error loading translation packages: {e}")
     
     def is_package_installed(self, from_lang: str, to_lang: str) -> bool:
+        """Check if direct translation package is installed"""
         for package in self.installed_packages:
             if package.from_code == from_lang and package.to_code == to_lang:
                 return True
         return False
     
+    def is_package_available(self, from_lang: str, to_lang: str) -> bool:
+        """Check if direct translation package is available for download"""
+        for package in self.available_packages:
+            if package.from_code == from_lang and package.to_code == to_lang:
+                return True
+        return False
+    
+    def find_translation_path(self, from_lang: str, to_lang: str) -> list:
+        """
+        Find shortest translation path using installed packages.
+        Always tries English as intermediate language first since it's most common.
+        """
+        if from_lang == to_lang:
+            return [from_lang]
+        
+        # Check for direct translation first
+        if self.is_package_installed(from_lang, to_lang):
+            return [from_lang, to_lang]
+        
+        # For non-English languages, try via English first (most common path)
+        if from_lang != 'en' and to_lang != 'en':
+            if (self.is_package_installed(from_lang, 'en') and 
+                self.is_package_installed('en', to_lang)):
+                return [from_lang, 'en', to_lang]
+        
+        # If English path doesn't work, do full BFS
+        return self._bfs_translation_path(from_lang, to_lang)
+    
+    def find_available_translation_path(self, from_lang: str, to_lang: str) -> list:
+        """
+        Find shortest translation path using available packages.
+        Always tries English as intermediate language first.
+        """
+        if from_lang == to_lang:
+            return [from_lang]
+        
+        # Check for direct translation first
+        if self.is_package_available(from_lang, to_lang):
+            return [from_lang, to_lang]
+        
+        # For non-English languages, try via English first
+        if from_lang != 'en' and to_lang != 'en':
+            if (self.is_package_available(from_lang, 'en') and 
+                self.is_package_available('en', to_lang)):
+                return [from_lang, 'en', to_lang]
+        
+        # If English path doesn't work, do full BFS on available packages
+        return self._bfs_available_translation_path(from_lang, to_lang)
+    
+    def _bfs_translation_path(self, from_lang: str, to_lang: str) -> list:
+        """BFS for installed packages"""
+        from collections import deque
+        
+        # Build graph of installed translations
+        available_translations = {}
+        for package in self.installed_packages:
+            if package.from_code not in available_translations:
+                available_translations[package.from_code] = []
+            available_translations[package.from_code].append(package.to_code)
+        
+        # BFS
+        queue = deque([(from_lang, [from_lang])])
+        visited = {from_lang}
+        
+        while queue:
+            current_lang, path = queue.popleft()
+            
+            if current_lang == to_lang:
+                return path
+            
+            if current_lang in available_translations and len(path) < 4:
+                for next_lang in available_translations[current_lang]:
+                    if next_lang not in visited:
+                        visited.add(next_lang)
+                        queue.append((next_lang, path + [next_lang]))
+        
+        return []
+    
+    def _bfs_available_translation_path(self, from_lang: str, to_lang: str) -> list:
+        """BFS for available packages"""
+        from collections import deque
+        
+        # Build graph of available translations
+        available_translations = {}
+        for package in self.available_packages:
+            if package.from_code not in available_translations:
+                available_translations[package.from_code] = []
+            available_translations[package.from_code].append(package.to_code)
+        
+        # BFS
+        queue = deque([(from_lang, [from_lang])])
+        visited = {from_lang}
+        
+        while queue:
+            current_lang, path = queue.popleft()
+            
+            if current_lang == to_lang:
+                return path
+            
+            if current_lang in available_translations and len(path) < 4:
+                for next_lang in available_translations[current_lang]:
+                    if next_lang not in visited:
+                        visited.add(next_lang)
+                        queue.append((next_lang, path + [next_lang]))
+        
+        return []
+    
+    def can_translate(self, from_lang: str, to_lang: str) -> bool:
+        """Check if translation is possible with currently installed packages"""
+        path = self.find_translation_path(from_lang, to_lang)
+        return len(path) >= 2
+    
+    def can_translate_if_installed(self, from_lang: str, to_lang: str) -> bool:
+        """Check if translation would be possible if required packages were installed"""
+        path = self.find_available_translation_path(from_lang, to_lang)
+        return len(path) >= 2
+    
+    def get_required_packages(self, from_lang: str, to_lang: str) -> list:
+        """Get list of (source, target) packages needed for translation"""
+        path = self.find_available_translation_path(from_lang, to_lang)
+        if len(path) < 2:
+            return []
+        
+        required_packages = []
+        for i in range(len(path) - 1):
+            source = path[i]
+            target = path[i + 1]
+            if not self.is_package_installed(source, target):
+                required_packages.append((source, target))
+        
+        return required_packages
+    
     def install_package(self, from_lang: str, to_lang: str) -> bool:
+        """Install a specific translation package"""
         try:
             package_to_install = None
             for package in self.available_packages:
@@ -188,30 +328,78 @@ class TranslationService:
                     break
             
             if package_to_install:
-                print(f"Installing {from_lang} -> {to_lang} package...")
+                print(f"Installing {from_lang} → {to_lang} package...")
                 argostranslate.package.install_from_path(package_to_install.download())
                 self.installed_packages = argostranslate.package.get_installed_packages()
-                print(f"Successfully installed {from_lang} -> {to_lang}")
+                print(f"Successfully installed {from_lang} → {to_lang}")
                 return True
             else:
-                print(f"Package {from_lang} -> {to_lang} not found")
+                print(f"Package {from_lang} → {to_lang} not found in available packages")
                 return False
         except Exception as e:
-            print(f"Error installing package: {e}")
+            print(f"Error installing package {from_lang} → {to_lang}: {e}")
             return False
     
+    def install_translation_path(self, from_lang: str, to_lang: str) -> bool:
+        """Install all packages needed for translation path"""
+        required_packages = self.get_required_packages(from_lang, to_lang)
+        
+        if not required_packages:
+            if self.can_translate(from_lang, to_lang):
+                print(f"Translation path {from_lang} → {to_lang} already available")
+                return True
+            else:
+                print(f"No translation path available for {from_lang} → {to_lang}")
+                return False
+        
+        print(f"Installing translation path {from_lang} → {to_lang}")
+        print(f"Required packages: {required_packages}")
+        
+        success_count = 0
+        for source, target in required_packages:
+            if self.install_package(source, target):
+                success_count += 1
+            else:
+                print(f"Failed to install {source} → {target}")
+        
+        success = success_count == len(required_packages)
+        if success:
+            print(f"Successfully installed all packages for {from_lang} → {to_lang}")
+        else:
+            print(f"Failed to install {len(required_packages) - success_count} packages")
+        
+        return success
+    
     def translate(self, text: str, from_lang: str, to_lang: str) -> str:
+        """Translate text using direct or pivot translation"""
         try:
             if not text.strip() or from_lang == to_lang:
                 return text
             
-            if not self.is_package_installed(from_lang, to_lang):
-                print(f"Translation package {from_lang}->{to_lang} not installed")
+            path = self.find_translation_path(from_lang, to_lang)
+            if len(path) < 2:
+                print(f"No translation path available from {from_lang} to {to_lang}")
                 return text
             
-            translated = argostranslate.translate.translate(text, from_lang, to_lang)
-            print(f"Translated: '{text}' ({from_lang}) -> '{translated}' ({to_lang})")
-            return translated
+            if len(path) == 2:
+                # Direct translation
+                translated = argostranslate.translate.translate(text, from_lang, to_lang)
+                print(f"Direct translation: '{text}' ({from_lang}) → '{translated}' ({to_lang})")
+                return translated
+            else:
+                # Pivot translation
+                current_text = text
+                print(f"Using pivot translation: {' → '.join(path)}")
+                
+                for i in range(len(path) - 1):
+                    source = path[i]
+                    target = path[i + 1]
+                    prev_text = current_text
+                    current_text = argostranslate.translate.translate(current_text, source, target)
+                    print(f"Step {i+1}: '{prev_text}' ({source}) → '{current_text}' ({target})")
+                
+                print(f"Final result: '{text}' ({from_lang}) → '{current_text}' ({to_lang})")
+                return current_text
             
         except Exception as e:
             print(f"Translation error: {e}")
@@ -220,63 +408,51 @@ class TranslationService:
 class OCRService:
     def __init__(self):
         self.sct = mss.mss()
-        self._configure_tesseract()
-        
         self.temp_image_path = os.path.join(tempfile.gettempdir(), 'ocr_screenshot-polyglot.png')
-        # Available Tesseract language codes
+        
+        # Check if we're on macOS and ocrmac is available
+        if not OCRMAC_AVAILABLE or platform.system() != "Darwin":
+            raise RuntimeError("ocrmac is only available on macOS. Please install with: pip install ocrmac")
+        
+        print("Using ocrmac (Apple Vision Framework) for OCR")
+        self._setup_ocrmac()
+        
+        # Current language setting
+        self.current_language = 'en'
+    
+    def _setup_ocrmac(self):
+        """Setup ocrmac with language mappings"""
+        # Map common language codes to IANA language tags for ocrmac
         self.language_codes = {
-            'en': 'eng',      # English
-            'es': 'spa',      # Spanish  
-            'fr': 'fra',      # French
-            'de': 'deu',      # German
-            'it': 'ita',      # Italian
-            'pt': 'por',      # Portuguese
-            'ru': 'rus',      # Russian (Cyrillic)
-            'ja': 'jpn',      # Japanese
-            'ko': 'kor',      # Korean
-            'zh': 'chi_sim+chi_tra',  # Chinese (Simplified + Traditional)
-            'ar': 'ara',      # Arabic
-            'hi': 'hin',      # Hindi
-            'nl': 'nld',      # Dutch
-            'sv': 'swe',      # Swedish
-            'da': 'dan',      # Danish
-            'no': 'nor',      # Norwegian
-            'fi': 'fin',      # Finnish
-            'pl': 'pol',      # Polish
-            'cs': 'ces',      # Czech
-            'sk': 'slk',      # Slovak
+            'en': 'en-US',      # English
+            'es': 'es-ES',      # Spanish  
+            'fr': 'fr-FR',      # French
+            'de': 'de-DE',      # German
+            'it': 'it-IT',      # Italian
+            'pt': 'pt-PT',      # Portuguese
+            'ru': 'ru-RU',      # Russian
+            'ja': 'ja-JP',      # Japanese
+            'ko': 'ko-KR',      # Korean
+            'zh': 'zh-Hans',    # Chinese (Simplified)
+            'ar': 'ar-SA',      # Arabic
+            'hi': 'hi-IN',      # Hindi
+            'nl': 'nl-NL',      # Dutch
+            'sv': 'sv-SE',      # Swedish
+            'da': 'da-DK',      # Danish
+            'no': 'no-NO',      # Norwegian
+            'fi': 'fi-FI',      # Finnish
+            'pl': 'pl-PL',      # Polish
+            'cs': 'cs-CZ',      # Czech
+            'sk': 'sk-SK',      # Slovak
         }
         
-        # Default to multi-language recognition
-        self.current_language = 'eng'
-        
-        # Basic config without character restrictions
-        self.tesseract_config = '--oem 3 --psm 6'
-
-    def _configure_tesseract(self):
-        """Configure Tesseract paths for bundled app"""
-        if getattr(sys, 'frozen', False):
-            # Running in bundle - use bundled Tesseract
-            bundle_dir = os.path.dirname(sys.executable)
-            tesseract_path = os.path.join(bundle_dir, 'tesseract', 'bin', 'tesseract')
-            
-            if os.path.exists(tesseract_path):
-                import stat
-                os.chmod(tesseract_path, os.stat(tesseract_path).st_mode | stat.S_IEXEC)
-                pytesseract.pytesseract.tesseract_cmd = tesseract_path
-                os.environ['TESSDATA_PREFIX'] = os.path.join(bundle_dir, 'tesseract')
-                return
-        
-        # Development or fallback - use system Tesseract
-        system_paths = ["/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"]
-        for path in system_paths:
-            if os.path.exists(path):
-                pytesseract.pytesseract.tesseract_cmd = path
-                break
+        # OCR settings
+        self.recognition_level = 'accurate'  # 'fast' or 'accurate'
+        self.use_livetext = True  # Try LiveText first (macOS Sonoma+)
     
     def set_language(self, language_code: str):
         """Set the OCR language"""
-        self.current_language = self.language_codes.get(language_code, 'eng')
+        self.current_language = self.language_codes.get(language_code)
         print(f"OCR language set to: {language_code} -> {self.current_language}")
     
     def capture_and_recognize(self, region: Region) -> str:
@@ -296,60 +472,45 @@ class OCRService:
             
             # Convert BGRA to RGB (remove alpha channel and swap B/R channels)
             img_rgb = img_array[:, :, [2, 1, 0]]  # BGRA -> RGB
+            imageio.imwrite(self.temp_image_path, img_rgb)
+            print(self.current_language)
+            # Try LiveText first (more accurate on newer macOS)
+            if self.use_livetext:
+                try:
+                    annotations = ocrmac.livetext_from_image(
+                        self.temp_image_path,
+                        language_preference=[self.current_language]
+                    )
+                    
+                    # Extract text from annotations
+                    if annotations:
+                        texts = [annotation[0] for annotation in annotations if annotation[0].strip()]
+                        result = ' '.join(texts)
+                        if result.strip():
+                            return self._clean_ocr_text(result)
+                except Exception as e:
+                    print(f"LiveText failed, falling back to Vision Framework: {e}")
             
-            # Convert RGB to BGR for OpenCV
-            img_cv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-            
-            # Preprocess image for better OCR results
-            img_processed = self._preprocess_for_ocr(img_cv)
-            
-            # Save processed image using imageio
-            imageio.imwrite(self.temp_image_path, img_processed)
-            
-            # Perform OCR with Tesseract using current language
-            # Read the image back with imageio for pytesseract
-            img_for_ocr = imageio.imread(self.temp_image_path)
-            text = pytesseract.image_to_string(
-                img_for_ocr,
-                config=self.tesseract_config,
-                lang=self.current_language
+            # Fallback to regular Vision Framework
+            ocr_instance = ocrmac.OCR(
+                self.temp_image_path,
+                recognition_level=self.recognition_level,
+                language_preference=[self.current_language]
             )
             
-            # Clean up the text (language-agnostic cleaning)
-            cleaned_text = self._clean_ocr_text(text)
-            return cleaned_text
+            annotations = ocr_instance.recognize()
+            
+            if annotations:
+                # Extract text from annotations (text, confidence, bounding_box)
+                texts = [annotation[0] for annotation in annotations if annotation[0].strip()]
+                result = ' '.join(texts)
+                return self._clean_ocr_text(result)
+            
+            return ""
             
         except Exception as e:
             print(f"OCR error: {e}")
             return ""
-    
-    def _preprocess_for_ocr(self, img):
-        """Preprocess image to improve OCR accuracy for subtitles"""
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Apply threshold to get better contrast
-        # For subtitles, we often want white text on dark background
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # If the background is darker than text, invert
-        if np.mean(thresh) < 127:
-            thresh = cv2.bitwise_not(thresh)
-        
-        # Apply morphological operations to clean up
-        kernel = np.ones((2, 2), np.uint8)
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        
-        # Resize image for better OCR (Tesseract works better with larger images)
-        height, width = cleaned.shape
-        if height < 50:  # If image is too small, scale it up
-            scale_factor = 3
-            cleaned = cv2.resize(cleaned, (width * scale_factor, height * scale_factor), interpolation=cv2.INTER_CUBIC)
-        
-        return cleaned
     
     def _clean_ocr_text(self, text: str) -> str:
         """Clean up OCR output text (language-agnostic)"""
@@ -422,15 +583,15 @@ class OCRController(Observable):
         if not settings.enabled:
             return True
         
-        return self.translation_service.is_package_installed(
+        return self.translation_service.can_translate(
             settings.source_language, 
             settings.target_language
         )
-    
+        
     def install_translation_package(self) -> bool:
-        """Install required translation package"""
+        """Install required translation packages for pivot translation"""
         settings = self.state.translation_settings
-        return self.translation_service.install_package(
+        return self.translation_service.install_translation_path(
             settings.source_language,
             settings.target_language
         )
@@ -518,7 +679,38 @@ class OCRController(Observable):
         self.state.status_message = message
         self.state.status_color = color
         self.notify_observers("status_changed", {"message": message, "color": color})
-    
+
+    def get_translation_info(self) -> dict:
+        """Get translation path information for UI display"""
+        settings = self.state.translation_settings
+        if not settings.enabled:
+            return {'status': 'disabled', 'message': 'Translation disabled'}
+        
+        # Check if currently possible
+        if self.translation_service.can_translate(settings.source_language, settings.target_language):
+            path = self.translation_service.find_translation_path(settings.source_language, settings.target_language)
+            return {
+                'status': 'available',
+                'path': path,
+                'message': f'Ready: {" → ".join(path)}'
+            }
+        
+        # Check if possible with installation
+        if self.translation_service.can_translate_if_installed(settings.source_language, settings.target_language):
+            path = self.translation_service.find_available_translation_path(settings.source_language, settings.target_language)
+            required = self.translation_service.get_required_packages(settings.source_language, settings.target_language)
+            return {
+                'status': 'needs_install',
+                'path': path,
+                'required_packages': required,
+                'message': f'Need {len(required)} packages for: {" → ".join(path)}'
+            }
+        
+        return {
+            'status': 'impossible',
+            'message': f'No translation available for {settings.source_language} → {settings.target_language}'
+        }
+
     def cleanup(self):
         """Cleanup resources"""
         self.stop_capture()
@@ -645,7 +837,7 @@ def region_selection_screen(page: ft.Page):
     selection_rect = ft.Container(
         width=0, height=0, left=0, top=0,
         bgcolor=ft.Colors.with_opacity(0.3, ft.Colors.RED),
-        border=ft.border.all(3, ft.Colors.RED),
+        border=ft.border.all(2, ft.Colors.RED),
         visible=False
     )
     
@@ -732,7 +924,7 @@ def region_selection_screen(page: ft.Page):
         on_pan_start=start_selection,
         on_pan_update=update_selection,
         on_pan_end=end_selection,
-        drag_interval=5,
+        drag_interval=1,
         mouse_cursor=ft.MouseCursor.PRECISE,
     )
     
@@ -1426,7 +1618,7 @@ class ModernOCRUI(Observer):
         self.page.update()
     
     def _check_translation_package(self):
-        """Check translation package availability"""
+        """Check translation package availability with pivot support"""
         settings = self.controller.state.translation_settings
         
         if not settings.enabled:
@@ -1436,20 +1628,49 @@ class ModernOCRUI(Observer):
             self.package_status.border = ft.border.all(1, "#cbd5e1")
             self.download_btn.visible = False
         else:
-            package_available = self.controller.check_translation_package()
+            # Get translation info
+            info = self.controller.get_translation_info()
             
-            if package_available:
-                self.package_status.content.value = "✓ Available"
+            if info['status'] == 'available':
+                # Translation is ready
+                path = info['path']
+                if len(path) == 2:
+                    self.package_status.content.value = "✓ Direct"
+                else:
+                    self.package_status.content.value = f"✓ Via {path[1]}"
+                
                 self.package_status.content.color = colors_map["primary"]
                 self.package_status.bgcolor = colors_map["secondary"]
-                self.package_status.border = ft.border.all(1,colors_map["primary"])
+                self.package_status.border = ft.border.all(1, colors_map["primary"])
                 self.download_btn.visible = False
-            else:
-                self.package_status.content.value = f"⚠ Missing"
+                
+            elif info['status'] == 'needs_install':
+                # Translation possible but needs packages
+                required_count = len(info['required_packages'])
+                path = info['path']
+                
+                if len(path) == 2:
+                    self.package_status.content.value = f"⚠ Need direct package"
+                else:
+                    self.package_status.content.value = f"⚠ Need {required_count} packages"
+                
                 self.package_status.content.color = "#dc2626"
                 self.package_status.bgcolor = "#fef2f2"
                 self.package_status.border = ft.border.all(1, "#dc2626")
                 self.download_btn.visible = True
+                
+                # Update button text
+                if required_count == 1:
+                    self.download_btn.content.value = "Download 1 model"
+                else:
+                    self.download_btn.content.value = f"Download {required_count} models"
+                    
+            else:  # impossible
+                self.package_status.content.value = "❌ Not available"
+                self.package_status.content.color = "#dc2626"
+                self.package_status.bgcolor = "#fef2f2"
+                self.package_status.border = ft.border.all(1, "#dc2626")
+                self.download_btn.visible = False
         
         self.page.update()
     

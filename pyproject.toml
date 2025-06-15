@@ -10,7 +10,7 @@ authors = [
 dependencies = [
     "flet==0.28.3",
     "argostranslate",
-    "pytesseract",
+    "ocrmac",
     "mss",
     "imageio",
     "opencv-python",
